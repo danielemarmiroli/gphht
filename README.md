@@ -14,7 +14,7 @@ While A) is more accurate for signal analysis, it is virtually useless for predi
 
 I attack the problem in a different way -- I use a Gaussian Process Regression to compute the envelopes of local extrema rather than interpolating splines. This has the following advantages: allows to explit the autoregressive features of the signal itself, thus introducing a much weaker prior; incorporates the notion of an observational error, minimises leakage effects. Cleary, it comes at the cost of being a much more computationally intensive.
 
-Based on @jaidevd pyhht module 
+**Based on @jaidevd pyhht module**
 
 Dependencies
 ------------
