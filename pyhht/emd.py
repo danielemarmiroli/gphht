@@ -12,6 +12,8 @@ import numpy as np
 from numpy import pi
 import warnings
 from scipy.interpolate import splrep, splev
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 from pyhht.utils import extr, boundary_conditions
 
 
@@ -20,7 +22,8 @@ class EmpiricalModeDecomposition(object):
 
     def __init__(self, x, t=None, threshold_1=0.05, threshold_2=0.5,
                  alpha=0.05, ndirs=4, fixe=0, maxiter=2000, fixe_h=0, n_imfs=0,
-                 nbsym=2, bivariate_mode='bbox_center'):
+                 nbsym=2, bivariate_mode='bbox_center', envelope_method='spline',
+                 gp_kernel=None):
         """Empirical mode decomposition.
 
         Parameters
@@ -62,6 +65,17 @@ class EmpiricalModeDecomposition(object):
             The algorithm to be used for bivariate EMD as described in [4].
             Can be one of 'centroid' or 'bbox_center'. This is ignored if the
             signal is real valued.
+	envelope_method : str, optional
+	    The algorithm to use in the envelope computations. Defaults to 
+	    a regular spline interpolant. `gaussian_process` uses a gaussian
+	    process regressor to compute the evelopes, which reduces tail 
+	    distortion but potentially creates signal overflow. 
+	   `gp_tail_ext` is an alternative to the mirroring procedure, it uses 
+	    a gaussian process regresor to estimate the value and position of
+	    next extrema, on which it applies a regular spline interpolant.
+       gp_kernel : sklearn.gaussian_process.kernel object to pass to the GP envelope
+            evaluation stage. Defaults to None, in which case a simple kernel
+            is chosen automatically. 
 
         Attributes
         ----------
@@ -152,12 +166,19 @@ class EmpiricalModeDecomposition(object):
         if fixe:
             self.maxiter = fixe
             if self.fixe_h:
-                raise TypeError("Cannot use both fixe and fixe_h modes")
+                raise TypeError("Cannot use both fixe and fixe_h modes at the same time")
         self.fixe = fixe
 
         self.is_bivariate = np.any(np.iscomplex(self.x))
         if self.is_bivariate:
             self.bivariate_mode = bivariate_mode
+
+    # GP method currently implemented for 1D signal only
+        if np.any(np.iscomplex(self.x)) & (envelope_method is not 'spline'):
+            raise TypeError("Non-spline methods are available for 1D signals only")
+        else:
+            self.envelope_method = envelope_method
+            self.gp_kernel = gp_kernel
 
         self.imf = []
         self.nbits = []
@@ -170,6 +191,7 @@ class EmpiricalModeDecomposition(object):
 #            if mask.shape[0]>1:
 #                mask = mask.ravel()
 #            imf1 = emd(x+mask, opts)
+
 
     def io(self):
         r"""Compute the index of orthoginality, as defined by:
@@ -204,6 +226,7 @@ class EmpiricalModeDecomposition(object):
         s = np.abs(dp[mask]).sum()
         return s / (2 * np.sum(self.x ** 2))
 
+
     def stop_EMD(self):
         """Check if there are enough extrema (3) to continue sifting.
 
@@ -229,19 +252,74 @@ class EmpiricalModeDecomposition(object):
             stop = ner < 3
         return stop
 
+
+    def gp_mean_envelope(self, m):
+        """ Computes the mean of the envelopes using a gaussian process regressor.
+            Uses the normal procedure to infer on starting values of the kernel parameters."""
+
+        # get maxima and minima in the usual way
+        indmin, indmax, indzer = extr(m)
+        nem = len(indmin) + len(indmax)
+        nzm = len(indzer)
+        tmin, tmax = self.t[indmin], self.t[indmax]
+        mmin, mmax = m[tmin], m[tmax]
+
+        if (len(tmin) < 2) or (len(tmax) < 2):
+            nem = 0
+            nzm = 0
+            envmoy = m
+            amp = 10**-10 * np.ones(m.shape)
+            return envmoy, nem, nzm, amp
+        else:
+            if self.envelope_method == 'gaussian_process':
+                # declare kernel and fit on maxima
+                l = np.mean(np.diff(tmax))
+                c_offset = np.mean(mmax)
+                noise = np.std(mmax)/10
+
+                self.gp_kernel = ConstantKernel() + \
+                1.0 * RBF(length_scale=l/4, length_scale_bounds=(l/8, 4*l)) + \
+                WhiteKernel(noise_level=noise, noise_level_bounds=(10**-9 *noise, 10*noise))
+
+                GP = GaussianProcessRegressor(kernel=self.gp_kernel).fit(tmax.reshape(-1,1), mmax)
+                envmax = GP.predict(self.t.reshape(-1,1), return_std=False, return_cov=False)
+
+                # declare kernel and fit on minima
+                l = np.mean(np.diff(tmin))
+                c_offset = np.mean(mmin)
+                noise = np.std(mmin) / 10
+
+                self.gp_kernel = ConstantKernel() + \
+                1.0 * RBF(length_scale=l/4, length_scale_bounds=(l/8, 4*l)) + \
+                WhiteKernel(noise_level=noise, noise_level_bounds=(10 ** -9 * noise, 10 * noise))
+
+                GP = GaussianProcessRegressor(kernel=self.gp_kernel).fit(tmin.reshape(-1,1), mmin)
+                envmin = GP.predict(self.t.reshape(-1,1), return_std=False, return_cov=False)
+
+                envmoy = (envmin + envmax) / 2
+                amp = np.abs(envmax - envmin) / 2.0
+                return envmoy, nem, nzm, amp
+            # elif self.envelope_method == 'gp_tail_ext':
+
+            else:
+                print('The kernel {} does not exist'.format(self.envelope_method))
+                return None
+
+
+
     def mean_and_amplitude(self, m):
         """ Compute the mean of the envelopes and the mode amplitudes.
 
         Parameters
         ----------
         m : array-like, shape (n_samples,)
-            The input array or an itermediate value of the sifting process.
+            The input array or an intermediate value of the sifting process.
 
         Returns
         -------
         tuple
             A tuple containing the mean of the envelopes, the number of
-            extrema, the number of zero crosssing and the estimate of the
+            extrema, the number of zero crossing and the estimate of the
             amplitude of themode.
         """
         # FIXME: The spline interpolation may not be identical with the MATLAB
@@ -305,6 +383,7 @@ class EmpiricalModeDecomposition(object):
 
                 envmoy = np.mean((envmin + envmax), axis=0)
                 amp = np.mean(abs(envmax - envmin), axis=0) / 2
+            
 
         else:
             indmin, indmax, indzer = extr(m)
@@ -326,11 +405,13 @@ class EmpiricalModeDecomposition(object):
 
             envmoy = (envmin + envmax) / 2
             amp = np.abs(envmax - envmin) / 2.0
+        
         if self.is_bivariate:
             nem = np.array(nem)
             nzm = np.array(nzm)
 
         return envmoy, nem, nzm, amp
+
 
     def stop_sifting(self, m):
         """Evaluate the stopping criteria for the current mode.
@@ -349,11 +430,17 @@ class EmpiricalModeDecomposition(object):
         """
         # FIXME: This method needs a better name.
         if self.fixe:
-            (moyenne, _, _, _), stop_sift = self.mean_and_amplitude(m), 0  # NOQA
+            if self.envelope_method == 'spline':
+                (moyenne, _, _, _), stop_sift = self.mean_and_amplitude(m), 0  # NOQA
+            else:
+                (moyenne, _, _, _), stop_sift = self.gp_mean_envelope(m), 0
         elif self.fixe_h:
             stop_count = 0
             try:
-                moyenne, nem, nzm = self.mean_and_amplitude(m)[:3]
+                if self.envelope_method == 'spline':
+                    moyenne, nem, nzm = self.mean_and_amplitude(m)[:3]
+                else:
+                    moyenne, nem, nzm = self.gp_mean_envelope(m)[:3]
 
                 if np.all(abs(nzm - nem) > 1):
                     stop = 0
@@ -366,14 +453,22 @@ class EmpiricalModeDecomposition(object):
                 stop = 1
             stop_sift = stop
         else:
+            envmoy, nem, nzm, amp = self.gp_mean_envelope(m)
             try:
-                envmoy, nem, nzm, amp = self.mean_and_amplitude(m)
+                if self.envelope_method == 'spline':
+                    envmoy, nem, nzm, amp = self.mean_and_amplitude(m)
+                # else:
+                    # envmoy, nem, nzm, amp = self.gp_mean_envelope(m)
+
             except TypeError as err:
                 if err.args[0] == "m > k must hold":
                     return 1, np.zeros((len(m)))
             except ValueError as err:
                 if err.args[0] == "Not enough extrema.":
                     return 1, np.zeros((len(m)))
+            except Exception as e:
+                print(e)
+                return 1, np.zeros((len(m)))
             sx = np.abs(envmoy) / amp
             stop = not(((np.mean(sx > self.threshold_1) > self.alpha) or
                         np.any(sx > self.threshold_2)) and np.all(nem > 2))
@@ -381,13 +476,15 @@ class EmpiricalModeDecomposition(object):
                 stop = stop and not(np.abs(nzm - nem) > 1)
             stop_sift = stop
             moyenne = envmoy
+
         return stop_sift, moyenne
+
 
     def keep_decomposing(self):
         """Check whether to continue the sifting operation."""
         return not(self.stop_EMD()) and \
-            (self.k < self.n_imfs + 1 or self.n_imfs == 0)  # and \
-# not(np.any(self.mask))
+            (self.k < self.n_imfs + 1 or self.n_imfs == 0)  # and not(np.any(self.mask))
+
 
     def decompose(self):
         """Decompose the input signal into IMFs.
